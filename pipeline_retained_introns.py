@@ -100,6 +100,8 @@ import sqlite3
 import CGAT.Experiment as E
 import CGATPipelines.Pipeline as P
 from CGATPipelines import PipelineRnaseq
+from CGAT import IOTools
+import PipelineRI
 
 # load options from the config file
 PARAMS = P.getParameters(
@@ -142,8 +144,9 @@ def connect():
 
     dbh = sqlite3.connect(PARAMS["database_name"])
     statement = '''ATTACH DATABASE '%s' as annotations''' % (
-        PARAMS["annotations_database"])
+        os.path.join(PARAMS["annotations_dir"], PARAMS["annotations_database"]))
     cc = dbh.cursor()
+    E.debug("Attaching annoatations: %s" % statement)
     cc.execute(statement)
     cc.close()
 
@@ -183,7 +186,9 @@ def filter_overlapping_genes(infile, outfile):
         stranded = "-s"
         
     statement = '''bedtools intersect -a %(infile)s -b %(infile)s -c %(stranded)s
-                 | awk '$10>1'
+                 | sed -E 's/;([0-9]+)$/\\t\\1/g'
+                 | awk -F'\\t' '$10==1'
+                 | sed -E 's/(.+;)(\\t[0-9]+)$/\\1/g'
                  | gzip > %(outfile)s'''
 
     P.run()
@@ -204,18 +209,18 @@ def find_retained_introns(infile, outfile):
            add_inputs(REFERENCE_GENESET),
            ".exons.tsv.gz")
 def annotate_exon_chunks(infiles, outfile):
-    '''Find those transcript chunks that represent consituative exons'''
+    '''Find those transcript chunks that represent  exons in some transcripts'''
 
     chunks, transcripts = infiles
 
-    statement = '''cgat gtf2gtf
-                        -I %(transcripts)s
-                        -L %(outfile)s.log
-                        --method=intersect-transcripts
+    job_memory="6G"
+    
+    statement = ''' zcat %(transcripts)s
+                 | awk '$3=="exon"'
                  | bedtools intersect -a %(chunks)s -b - -c -s
-                 | sed -E 's/.+gene_id \\"(\w+)\\".+exon_id \\"([\+)\\".+([0-9]+)$/\\1\\t\\2\\t\\3/' 
+                 | sed -E 's/.+gene_id \\"(\w+)\\".+exon_id \\"(\w+)\\".+\\t([0-9]+)$/\\1\\t\\2\\t\\3/' 
                  | sed '1i gene_id\\texon_id\\texon'
-                 > %(outfile)s'''
+                 | gzip > %(outfile)s'''
     
     P.run()
 
@@ -230,14 +235,18 @@ def annotated_intron_chunks(infiles, outfile):
 
     chunks, transcripts = infiles
 
-    statement = '''cgat gtf2gtf
-                        -I (transcripts)s
+    statement = '''
+                   cgat gtf2gtf
+                        -I %(transcripts)s
+                        -L %(outfile)s.log
+                        --method=set-gene-to-transcript
+                 | cgat gtf2gtf
                         -L %(outfile)s.log
                         --method=exons2introns
                  | bedtools intersect -a %(chunks)s -b - -c -s
-                 |  sed -E 's/.+gene_id \\"(\w+)\\".+exon_id \\"([\+)\\".+([0-9]+)$/\\1\\t\\2\\t\\3/' 
+                 | sed -E 's/.+gene_id \\"(\w+)\\".+exon_id \\"(\w+)\\".+([0-9]+)$/\\1\\t\\2\\t\\3/' 
                  | sed '1i gene_id\\texon_id\\texon'
-                 > %(outfile)s'''
+                 | gzip > %(outfile)s'''
     
     P.run()
 
@@ -246,26 +255,27 @@ def annotated_intron_chunks(infiles, outfile):
 @transform(filter_overlapping_genes,
            suffix(".gtf.gz"),
            add_inputs(find_retained_introns),
-           ".retained_introns.gtf.gz")
+           ".retained_introns.tsv.gz")
 def annotate_retained_introns(infiles, outfile):
     '''find chunks that overlap with annotated retained introns'''
 
     chunks, introns = infiles
 
-    statement = ''' bedtools intersect -a %(chunks)s -b %(infiles)s -s -c
-                  | sed -E 's/.+gene_id \\"(\w+)\\".+exon_id \\"([\+)\\".+([0-9]+)$/\\1\\t\\2\\t\\3/' 
+    statement = ''' bedtools intersect -a %(chunks)s -b %(introns)s -s -c
+                  | sed -E 's/.+gene_id \\"(\w+)\\".+exon_id \\"(\w+)\\".+([0-9]+)$/\\1\\t\\2\\t\\3/' 
                   | sed '1i gene_id\\texon_id\\texon'
-                 > %(outfile)s'''
+                  | gzip > %(outfile)s'''
 
     P.run()
 
+    
 ###################################################################
 @transform([annotate_retained_introns,
             annotate_exon_chunks,
             annotated_intron_chunks],
            suffix(".tsv.gz"),
            ".load")
-def load_chunk_annotations(infiles, outfile):
+def load_chunk_annotations(infile, outfile):
 
     P.load(infile, outfile, "-i gene_id -i exon_id")
 
@@ -334,7 +344,7 @@ def count_chunks(infiles, outfile):
         outfile,
         job_threads=PARAMS["featurecounts_threads"],
         strand=PARAMS["stranded"],
-        options=PARAMS["featurecounts_options"])
+        options="-f " + PARAMS["featurecounts_options"])
 
 
 ###################################################################
@@ -358,9 +368,9 @@ def merge_chunk_counts(infiles, outfile):
 
 
 ###################################################################
-@follows("dexseq.dir")
+@follows(mkdir("dexseq.dir"))
 @transform(generate_dexseq_design_files,
-           regex(".+/(.+).design.txt"),
+           regex("(.+).design.txt"),
            add_inputs(merge_chunk_counts,
                       filter_overlapping_genes,
                       annotated_intron_chunks),
@@ -370,7 +380,7 @@ def run_dexseq(infiles, outfile):
 
     design, counts, models, introns = infiles
 
-    infiles = ",".join([models, counts, design])
+    infiles = ",".join([models, counts, design, introns])
     outfile = P.snip(outfile, ".tsv")
 
     job_threads = PARAMS["dexseq_threads"]
@@ -473,7 +483,7 @@ def export_bigwigs(infile, outfile):
     visualisation'''
  
     genome_file = os.path.join(PARAMS['annotations_dir'],
-                               PARAMS["annotations_interface_contigs_tsv"))
+                               PARAMS["annotations_interface_contigs_tsv"])
 
     tmp = P.getTempFilename()
     statement = ''' genomeCoverageBed -split -bg -ibam %(infile)s
@@ -493,10 +503,10 @@ def export_bigwigs(infile, outfile):
     P.run()
     
 ###################################################################
-@follows([ export_chunks,
+@follows( export_chunks,
            export_retained_introns,
            export_sig_introns,
-           export_bigwigs])
+           export_bigwigs)
 def export():
     pass
 

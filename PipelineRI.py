@@ -1,7 +1,8 @@
-from CGAT import IOTools, GTF
+from CGAT import IOTools, GTF, Intervals
 from CGATPipelines.Pipeline import cluster_runnable
 from CGATPipelines.Pipeline import run 
 import itertools
+
 
 def exportGTF(infile, outfile):
     '''This function will take an (optionally gziped) GTF
